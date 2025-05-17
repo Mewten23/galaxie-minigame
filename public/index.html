@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <title>Galaxiekarte Multiplayer - Level 11</title>
+    <style>
+        /* Basis-Stile */
+        body { margin: 0; overflow: hidden; }
+        canvas { display: block; background-color: black; }
+        #statusPanel {
+            position: absolute;
+            top: 80px;
+            right: 20px;
+            background: rgba(0,0,0,0.85);
+            color: white;
+            padding: 10px 15px;
+            border: 2px solid white;
+            border-radius: 10px;
+            font-family: Arial, sans-serif;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <!-- UI-Elemente -->
+    <button id="addShipBtn" style="position: absolute; top: 10px; right: 10px; z-index: 9999;">
+        Schiff hinzufügen
+    </button>
+    <canvas id="game"></canvas>
+    <div id="shipInfo" style="position: absolute; background: rgba(0,0,0,0.8); color: white; padding: 5px 10px; border-radius: 5px; display: none; pointer-events: auto; font-family: Arial, sans-serif; font-size: 14px;"></div>
+    <div id="hyperjumpNotice" style="position: absolute; top: 10px; left: 50%; transform: translateX(-50%); background: rgba(255,255,255,0.9); color: black; padding: 8px 15px; border: 2px solid black; border-radius: 10px; font-family: Arial, sans-serif; font-size: 16px; display: none; pointer-events: none;">
+        Hyperraumantrieb aktiviert: Bitte klicke jetzt das Ziel auf der Karte!
+    </div>
+    <div id="statusPanel"></div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+        // Socket & Canvas
+        const socket = io();
+        const canvas = document.getElementById('game');
+        const ctx = canvas.getContext('2d');
+        const shipInfo = document.getElementById('shipInfo');
+        const hyperjumpNotice = document.getElementById('hyperjumpNotice');
+        const statusPanel = document.getElementById('statusPanel');
+
+        // Spielzustand
+        let ships = {};
+        let myId = null;
+        let isSelectingHyperjumpTarget = false;
+        let selectedShipId = null;
+        const activeJumps = new Set();
+        let camera = { x: 0, y: 0, zoom: 1 };
+        let dragging = false;
+        let dragStart = { x: 0, y: 0 };
+        let lastFrameTime = null;
+
+        // Schiff hinzufügen
+        document.getElementById('addShipBtn').addEventListener('click', () => {
+            const name = prompt("Gib einen Namen für das neue Schiff ein:");
+            const type = prompt("Wähle Schiffstyp: Venator / Acclamator / Arquitens");
+            if (name && type) socket.emit('addShip', { name, type });
+        });
+
+        // Bilder laden
+        const background = new Image(); background.src = 'Galaxiemap.jpg';
+        const shipIcon = new Image(); shipIcon.src = 'Venator.png';
+        const acclamatorIcon = new Image(); acclamatorIcon.src = 'Acclamator.png';
+        const arquitensIcon = new Image(); arquitensIcon.src = 'Arquitens.png';
+        let imagesLoadCount = 0;
+        function init() {
+            imagesLoadCount++;
+            if (imagesLoadCount === 4) {
+                canvas.width = window.innerWidth;
+                canvas.height = window.innerHeight;
+                requestAnimationFrame(gameLoop);
+            }
+        }
+        background.onload = init;
+        shipIcon.onload = init;
+        acclamatorIcon.onload = init;
+        arquitensIcon.onload = init;
+
+        // Spieler registrieren
+        socket.on('connect', () => {
+            const playerName = prompt("Gib deinen Spielernamen ein:");
+            if (playerName) {
+                myId = playerName;
+                socket.emit('registerPlayer', playerName);
+            }
+        });
+
+        // Server-Updates mergen (lokale Flags erhalten)
+        socket.on('updateShips', serverShips => {
+            for (const id in serverShips) {
+                const srv = serverShips[id];
+                if (ships[id]) {
+                    ships[id].x = srv.x;
+                    ships[id].y = srv.y;
+                    ships[id].owner = srv.owner;
+                    ships[id].name = srv.name;
+                    ships[id].type = srv.type;
+                    // Nur RotationAngle übernehmen, wenn nicht in Rotationsphase
+                    if (!ships[id].isPreparingJump) ships[id].rotationAngle = srv.rotationAngle;
+                } else {
+                    ships[id] = {
+                        ...srv,
+                        isPreparingJump: false,
+                        hyperjumpInProgress: false,
+                        target: null,
+                        desiredAngle: 0
+                    };
+                }
+            }
+            updateStatusPanel();
+        });
+
+        // Zeichnen aller Elemente
+        function draw() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.save();
+            ctx.translate(-camera.x, -camera.y);
+            ctx.scale(camera.zoom, camera.zoom);
+            ctx.drawImage(background, 0, 0);
+            for (const id in ships) {
+                const ship = ships[id];
+                ctx.globalAlpha = ship.owner === myId ? 1.0 : 0.7;
+                const w = 30, h = 20;
+                const cx = ship.x + w/2, cy = ship.y + h/2;
+                // Drehphase
+                if (ship.isPreparingJump) {
+                    const maxStep = 0.005;
+                    let diff = ship.desiredAngle - ship.rotationAngle;
+                    diff = Math.atan2(Math.sin(diff), Math.cos(diff));
+                    ship.rotationAngle += Math.abs(diff) > maxStep ? Math.sign(diff) * maxStep : diff;
+                }
+                ctx.save();
+                ctx.translate(cx, cy);
+                ctx.rotate(ship.rotationAngle || 0);
+                const iconImg = ship.type === 'Acclamator' ? acclamatorIcon : ship.type === 'Arquitens' ? arquitensIcon : shipIcon;
+                ctx.drawImage(iconImg, -w/2, -h/2, w, h);
+                ctx.restore();
+                ctx.font = '14px Arial';
+                ctx.fillStyle = 'white';
+                ctx.textAlign = 'center';
+                ctx.fillText(ship.name, cx, ship.y - 5);
+            }
+            ctx.globalAlpha = 1.0;
+            ctx.restore();
+        }
+
+        // Statuspanel aktualisieren
+        function updateStatusPanel() {
+            let html = `<b>Status deiner Schiffe</b><br><br>`;
+            for (const id in ships) {
+                const ship = ships[id];
+                if (ship.owner !== myId) continue;
+                let rem = '-';
+                if (ship.hyperjumpInProgress && ship.target) {
+                    const dx = ship.target.x - ship.x;
+                    const dy = ship.target.y - ship.y;
+                    const d = Math.sqrt(dx*dx + dy*dy);
+                    rem = `${Math.ceil((d/3500*600)/60)} Minuten`;
+                }
+                html += `Schiff: ${ship.name}<br>Ankunft: ${rem}<br><br>`;
+            }
+            statusPanel.innerHTML = html;
+        }
+
+        // Menü öffnen (Icon oder Button)
+        function openShipMenu(id) {
+            if (ships[id].owner !== myId) { alert("Du kannst nur eigene Schiffe verwalten."); return; }
+            const ship = ships[id];
+            const w = 30, h = 20;
+            // Bildschirmkoordinaten berechnen
+            const screenX = (ship.x + w/2 - camera.x) * camera.zoom;
+            const screenY = (ship.y + h/2 - camera.y) * camera.zoom;
+            shipInfo.style.left = `${screenX}px`;
+            shipInfo.style.top = `${screenY}px`;
+            const disabled = ship.hyperjumpInProgress ? 'disabled style="background-color:gray;"' : '';
+            shipInfo.innerHTML = `
+                <b>${ship.name}</b><br>ID: ${id}<br><br>
+                <button onclick="startHyperdrive('${id}')" ${disabled}>Hyperraumantrieb starten</button><br>
+                <button onclick="activateWeapons('${id}')">Waffensysteme aktivieren</button><br>
+                <button onclick="evacuateShip('${id}')">Schiff evakuieren</button>
+            `;
+            shipInfo.style.display = 'block';
+        }
+
+        // Hyperdrive starten
+        function startHyperdrive(id) {
+            const ship = ships[id];
+            if (!ship.hyperjumpInProgress) {
+                isSelectingHyperjumpTarget = true;
+                selectedShipId = id;
+                ship.isPreparingJump = true;
+                shipInfo.style.display = 'none';
+                hyperjumpNotice.style.display = 'block';
+            }
+        }
+
+        // Waffen aktivieren
+        function activateWeapons(id) {
+            alert(`${ships[id].name} hat die Waffensysteme aktiviert!`);
+        }
+
+        // Schiff evakuieren (mit Bestätigung)
+        function evacuateShip(id) {
+            if (!confirm(`Soll ${ships[id].name} wirklich evakuiert werden?`)) return;
+            socket.emit('evacuateShip', id);
+            alert(`Evakuierungsbefehl an ${ships[id].name} erteilt. Entfernen in 30 Sekunden.`);
+        }
+
+        // Animation der Hyperjumps
+        function animateHyperjump(timestamp) {
+            if (!lastFrameTime) lastFrameTime = timestamp;
+            const dt = (timestamp - lastFrameTime) / 1000;
+            lastFrameTime = timestamp;
+            let redraw = false;
+            activeJumps.forEach(id => {
+                const s = ships[id];
+                if (!s || !s.hyperjumpInProgress || !s.target) { activeJumps.delete(id); return; }
+                const step = 5.83 * dt;
+                const dx = s.target.x - s.x;
+                const dy = s.target.y - s.y;
+                const dist = Math.sqrt(dx*dx + dy*dy);
+                if (dist <= step) {
+                    s.x = s.target.x;
+                    s.y = s.target.y;
+                    s.hyperjumpInProgress = false;
+                    activeJumps.delete(id);
+                    socket.emit('moveShip', { shipId: id, x: s.x, y: s.y, rotationAngle: s.rotationAngle });
+                    alert(`${s.name} ist angekommen!`);
+                } else {
+                    s.x += (dx / dist) * step;
+                    s.y += (dy / dist) * step;
+                    socket.emit('moveShip', { shipId: id, x: s.x, y: s.y, rotationAngle: s.rotationAngle });
+                }
+                redraw = true;
+            });
+            if (redraw) draw();
+        }
+
+        // Klick-Handling (Zielwahl & Menü)
+        canvas.addEventListener('click', e => {
+            if (e.button !== 0) return;
+            if (isSelectingHyperjumpTarget) {
+                const cx = e.offsetX;
+                const cy = e.offsetY;
+                const worldX = (cx + camera.x) / camera.zoom;
+                const worldY = (cy + camera.y) / camera.zoom;
+                const w = 30, h = 20;
+                const ship = ships[selectedShipId];
+                ship.desiredAngle = Math.atan2(worldY - ship.y, worldX - ship.x) + Math.PI; // 180°-Offset
+                ship.target = { x: worldX - w/2, y: worldY - h/2 };
+                isSelectingHyperjumpTarget = false;
+                hyperjumpNotice.style.display = 'none';
+                alert(`Ziel gesetzt. Sprung in 10 Sekunden...`);
+                setTimeout(() => {
+                    const s = ships[selectedShipId];
+                    if (s) {
+                        s.isPreparingJump = false;
+                        s.hyperjumpInProgress = true;
+                        activeJumps.add(selectedShipId);
+                        lastFrameTime = null;
+                    }
+                }, 10000);
+                return;
+            }
+            const px = (e.clientX + camera.x) / camera.zoom;
+            const py = (e.clientY + camera.y) / camera.zoom;
+            let hit = null;
+            for (const id in ships) {
+                const s = ships[id];
+                if (px >= s.x && px <= s.x + 30 && py >= s.y && py <= s.y + 20) { hit = id; break; }
+            }
+            if (hit && ships[hit].owner === myId) openShipMenu(hit);
+            else shipInfo.style.display = 'none';
+        });
+
+        // Zoom & Drag
+        canvas.addEventListener('wheel', e => {
+            e.preventDefault();
+            const f = e.deltaY < 0 ? 1.1 : 0.9;
+            const mx = e.clientX, my = e.clientY;
+            const wx = (mx + camera.x) / camera.zoom;
+            const wy = (my + camera.y) / camera.zoom;
+            camera.zoom *= f;
+            camera.x = wx * camera.zoom - mx;
+            camera.y = wy * camera.zoom - my;
+            draw();
+        });
+        canvas.addEventListener('mousedown', e => { if (e.button === 2) { dragging = true; dragStart.x = e.clientX + camera.x; dragStart.y = e.clientY + camera.y; } });
+        canvas.addEventListener('mouseup', e => { if (e.button === 2) dragging = false; });
+        canvas.addEventListener('mousemove', e => { if (dragging) { camera.x = dragStart.x - e.clientX; camera.y = dragStart.y - e.clientY; draw(); } });
+        window.addEventListener('contextmenu', e => e.preventDefault());
+        window.addEventListener('resize', () => { canvas.width = window.innerWidth; canvas.height = window.innerHeight; draw(); });
+
+        // Haupt-Game-Loop
+        function gameLoop(ts) {
+            animateHyperjump(ts);
+            draw();
+            updateStatusPanel();
+            requestAnimationFrame(gameLoop);
+        }
+    </script>
+</body>
+</html>
